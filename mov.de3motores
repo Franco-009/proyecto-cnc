@@ -1,0 +1,86 @@
+// Prueba 3 motores: 2 x NEMA17 (step/dir) + 28BYJ-48 (ULN2003)
+// NEMA17 controlado por step/dir manual
+// 28BYJ-48 controlado por librería Stepper
+
+#include <Stepper.h>
+
+/////////////////////// NEMA 17 (step/dir) ///////////////////////
+#define DIR_PIN1 27
+#define STEP_PIN1 14
+
+#define DIR_PIN2 25
+#define STEP_PIN2 26
+
+/////////////////////// 28BYJ-48 (ULN2003) ///////////////////////
+#define IN1_PIN 4   // IN1 -> P4
+#define IN2_PIN 0   // IN2 -> P0  (ojo: strapping pin, si da problemas cambiarlo)
+#define IN3_PIN 2   // IN3 -> P2  (ojo: strapping pin)
+#define IN4_PIN 15  // IN4 -> P15
+
+// El 28BYJ-48 tiene aprox. 2048 pasos por vuelta en modo paso completo
+const int pasosPorVuelta28 = 2048;
+
+// Crear objeto Stepper
+Stepper motor28BYJ(pasosPorVuelta28, IN1_PIN, IN3_PIN, IN2_PIN, IN4_PIN);
+// ⚠️ el orden de los pines importa, este (IN1, IN3, IN2, IN4) es el correcto para ULN2003
+
+void setup() {
+  Serial.begin(115200);
+
+  // NEMA 17
+  pinMode(DIR_PIN1, OUTPUT);
+  pinMode(STEP_PIN1, OUTPUT);
+  pinMode(DIR_PIN2, OUTPUT);
+  pinMode(STEP_PIN2, OUTPUT);
+
+  // Configurar velocidad del 28BYJ (en RPM)
+  motor28BYJ.setSpeed(15);  // probá con 10–20 RPM
+  Serial.println("Inicio prueba 3 motores");
+}
+
+/////////////////////// Funciones ///////////////////////
+
+// Mover motor step/dir (NEMA 17)
+void moverMotor(int dirPin, int stepPin, bool sentido, int pasos, unsigned int velocidadMicros) {
+  digitalWrite(dirPin, sentido ? HIGH : LOW);
+  for (int i = 0; i < pasos; i++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(velocidadMicros);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(velocidadMicros);
+  }
+}
+
+/////////////////////// Loop de prueba ///////////////////////
+void loop() {
+  const int pasosNemaTest = 200;       // 200 pasos = 1 vuelta típica
+  const unsigned int velNema = 800;    // microsegundos entre pasos
+
+  Serial.println(">> NEMA1: adelante");
+  moverMotor(DIR_PIN1, STEP_PIN1, HIGH, pasosNemaTest, velNema);
+  delay(500);
+
+  Serial.println(">> NEMA2: atras");
+  moverMotor(DIR_PIN2, STEP_PIN2, LOW, pasosNemaTest, velNema);
+  delay(500);
+
+  Serial.println(">> NEMA1: atras");
+  moverMotor(DIR_PIN1, STEP_PIN1, LOW, pasosNemaTest, velNema);
+  delay(500);
+
+  Serial.println(">> NEMA2: adelante");
+  moverMotor(DIR_PIN2, STEP_PIN2, HIGH, pasosNemaTest, velNema);
+  delay(500);
+
+  // 28BYJ-48
+  Serial.println(">> 28BYJ: sentido A (sube)");
+  motor28BYJ.step(pasosPorVuelta28 / 2);   // media vuelta adelante
+  delay(600);
+
+  Serial.println(">> 28BYJ: sentido B (baja)");
+  motor28BYJ.step(-pasosPorVuelta28 / 2);  // media vuelta atrás
+  delay(1000);
+
+  Serial.println("Ciclo de prueba completo. Repetir...");
+  delay(1000);
+}
