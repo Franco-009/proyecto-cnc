@@ -1,0 +1,120 @@
+#include <Stepper.h>
+
+/////////////////////// CONFIGURACIÓN MOTORES ///////////////////////
+// NEMA 17 - Ejes X y Y
+#define DIR_X 27
+#define STEP_X 14
+
+#define DIR_Y 25
+#define STEP_Y 26
+
+// 28BYJ-48 - Eje Z (sube/baja lápiz)
+#define IN1 4
+#define IN2 0
+#define IN3 2
+#define IN4 15
+Stepper motorZ(2048, IN1, IN3, IN2, IN4);  // orden correcto para ULN2003
+
+// Configuración básica
+const float mmPorPaso_X = 0.05; // calibrar según tu mecánica
+const float mmPorPaso_Y = 0.05; // calibrar según tu mecánica
+const int pasosPorVueltaZ = 2048;
+
+// Velocidad base
+const unsigned int velNema = 600; // microsegundos entre pasos
+int velocidadZ = 10;              // en RPM
+
+// Posición actual del cabezal
+float posX = 0, posY = 0, posZ = 0;
+
+/////////////////////// SETUP ///////////////////////
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Mini CNC ESP32 listo!");
+
+  pinMode(DIR_X, OUTPUT);
+  pinMode(STEP_X, OUTPUT);
+  pinMode(DIR_Y, OUTPUT);
+  pinMode(STEP_Y, OUTPUT);
+
+  motorZ.setSpeed(velocidadZ);
+}
+
+/////////////////////// FUNCIONES DE MOVIMIENTO ///////////////////////
+
+void moverEje(int dirPin, int stepPin, bool sentido, int pasos) {
+  digitalWrite(dirPin, sentido ? HIGH : LOW);
+  for (int i = 0; i < pasos; i++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(velNema);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(velNema);
+  }
+}
+
+void moverX(float distanciaMM) {
+  int pasos = abs(distanciaMM / mmPorPaso_X);
+  bool sentido = distanciaMM > 0;
+  moverEje(DIR_X, STEP_X, sentido, pasos);
+  posX += distanciaMM;
+}
+
+void moverY(float distanciaMM) {
+  int pasos = abs(distanciaMM / mmPorPaso_Y);
+  bool sentido = distanciaMM > 0;
+  moverEje(DIR_Y, STEP_Y, sentido, pasos);
+  posY += distanciaMM;
+}
+
+void moverZ(float distanciaMM) {
+  int pasos = abs(distanciaMM * 1024 / 2); // cada 2 cm aprox.
+  if (distanciaMM > 0) motorZ.step(pasos);
+  else motorZ.step(-pasos);
+  posZ += distanciaMM;
+}
+
+/////////////////////// PARSER DE COMANDOS ///////////////////////
+
+void interpretarComando(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd.startsWith("G0") || cmd.startsWith("G1")) { // Movimiento
+    float x = NAN, y = NAN, z = NAN;
+
+    // Extraer coordenadas
+    int ix = cmd.indexOf('X');
+    int iy = cmd.indexOf('Y');
+    int iz = cmd.indexOf('Z');
+
+    if (ix != -1) x = cmd.substring(ix + 1).toFloat();
+    if (iy != -1) y = cmd.substring(iy + 1).toFloat();
+    if (iz != -1) z = cmd.substring(iz + 1).toFloat();
+
+    // Movimiento relativo
+    if (!isnan(x)) moverX(x);
+    if (!isnan(y)) moverY(y);
+    if (!isnan(z)) moverZ(z);
+
+    Serial.printf("Posición actual: X=%.2f Y=%.2f Z=%.2f\n", posX, posY, posZ);
+  }
+  else if (cmd.startsWith("HOME")) {
+    Serial.println("Volviendo al origen...");
+    moverX(-posX);
+    moverY(-posY);
+    moverZ(-posZ);
+    posX = posY = posZ = 0;
+  }
+  else {
+    Serial.println("Comando desconocido");
+  }
+}
+
+/////////////////////// LOOP PRINCIPAL ///////////////////////
+
+void loop() {
+  if (Serial.available()) {
+    String comando = Serial.readStringUntil('\n');
+    interpretarComando(comando);
+  }
+}
