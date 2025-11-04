@@ -1,0 +1,378 @@
+#include <Arduino.h>
+#include <Stepper.h>
+#include <math.h>
+
+//=================== CONFIG. PINES ===================//
+// NEMA17 X/Y con DRV8825
+#define DIR_X   27
+#define STEP_X  14
+#define DIR_Y   25
+#define STEP_Y  26
+
+// OPCIONAL: si conectás ENABLE (EN) del DRV8825 a un GPIO, ponelo aquí.
+// Si NO lo usás (EN a GND), dejá -1.
+#define EN_PIN  -1   // ej: 12 si querés controlarlo
+
+// Si conectás SLEEP y RESET a un GPIO, podés manejarlos acá.
+// Si los uniste y los llevaste a VDD, dejá -1.
+#define SLP_PIN -1
+#define RST_PIN -1
+
+// 28BYJ-48 - Eje Z (ULN2003)
+#define IN1 16
+#define IN2 17
+#define IN3 18
+#define IN4 19
+Stepper motorZ(2048, IN1, IN3, IN2, IN4);  // orden correcto ULN2003
+
+// Endstops (NC -> a GND, reposo HIGH)
+#define ENDSTOP_X 32
+#define ENDSTOP_Y 33
+
+//=================== DIRECCIONES / HOMING ===================//
+// Si un eje corre "al revés", poné true para invertir su DIR por software.
+const bool INVERT_DIR_X = true;
+const bool INVERT_DIR_Y = true;
+const bool INVERT_DIR_Z = true;
+
+// ¿Dónde está el endstop de cada eje?
+// true = homing hacia MIN (posición 0); false = homing hacia MAX.
+const bool HOME_TO_MIN_X = true;
+const bool HOME_TO_MIN_Y = true;
+
+//=================== CINEMÁTICA ===================//
+// GT2 (2 mm), polea 20T -> 40 mm por vuelta
+// Motor 200 pasos/vuelta, DRV8825 1/16 -> 200*16/40 = 80 steps/mm
+const float stepsPerMM_X = 80.0f;
+const float stepsPerMM_Y = 80.0f;
+
+// Límites en mm de tu mesa (ajustá a tu máquina)
+const float X_MIN_MM = 0.0f;
+const float X_MAX_MM = 250.0f;
+const float Y_MIN_MM = 0.0f;
+const float Y_MAX_MM = 250.0f;
+
+// Timing
+const unsigned int STEP_PULSE_US = 5;     // ancho de pulso STEP (>=3us)
+const unsigned int STEP_GAP_US   = 600;   // tiempo entre pasos (velocidad base)
+const unsigned int DIR_SETUP_US  = 10;    // pausa tras cambiar DIR
+const float RAPID_FEED_MM_MIN    = 3000;  // >>> feedrate de G0 (rápido)
+
+// Z
+int velocidadZ = 15; // RPM para Stepper Z (28BYJ-48)
+
+// Posición actual (mm)
+float posX = 0.0f, posY = 0.0f, posZ = 0.0f;
+
+// ====== Estados de interpretación G-code ====== (>>> NUEVO)
+bool absoluteMode = true;        // G90 (por defecto)
+float feed_mm_min = 600.0f;      // F... mm/min (por defecto)
+
+//=================== HELPERS ===================//
+inline void pulseStep(uint8_t stepPin) {
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(STEP_PULSE_US);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(STEP_GAP_US);
+}
+
+bool endstopActive(uint8_t pin) {            // activo en LOW con PULLUP
+  // Debounce simple: 5 lecturas, 4 deben coincidir
+  int c = 0;
+  for (int i = 0; i < 5; i++) { c += (digitalRead(pin) == LOW); delay(1); }
+  return c >= 4;
+}
+
+// Aplica inversión de dirección por eje
+inline void setDir(uint8_t dirPin, bool sentidoPositivo, bool invertAxis) {
+  bool nivel = (sentidoPositivo ^ invertAxis) ? HIGH : LOW;
+  digitalWrite(dirPin, nivel);
+  delayMicroseconds(DIR_SETUP_US);
+}
+
+// Limita un destino a los soft limits (>>> usada para bloquear salidas)
+inline bool insideLimits(float tx, float ty) {
+  return (tx >= X_MIN_MM && tx <= X_MAX_MM && ty >= Y_MIN_MM && ty <= Y_MAX_MM);
+}
+
+//=================== MOVIMIENTO ===================//
+
+// >>> Movimiento lineal XY coordinado (Bresenham + feedrate)
+void moverLinealXY(float dx_mm, float dy_mm, float feed_mm_minute) {
+  long sx = lround(fabs(dx_mm) * stepsPerMM_X);
+  long sy = lround(fabs(dy_mm) * stepsPerMM_Y);
+  if (sx == 0 && sy == 0) return;
+
+  bool dirXpos = dx_mm >= 0;
+  bool dirYpos = dy_mm >= 0;
+
+  setDir(DIR_X, dirXpos, INVERT_DIR_X);
+  setDir(DIR_Y, dirYpos, INVERT_DIR_Y);
+
+  // Duración objetivo según feedrate
+  float dist_mm = sqrt(dx_mm*dx_mm + dy_mm*dy_mm);
+  float v_mms   = max(1.0f, feed_mm_minute / 60.0f);        // mm/s
+  float dur_s   = dist_mm / v_mms;                          // s
+  long  nTicks  = max( (long)1, max(sx, sy) );              // ticks = pasos máximos
+  unsigned long perTick_us = (unsigned long)((dur_s * 1e6) / nTicks);
+  unsigned long min_us = STEP_PULSE_US + STEP_GAP_US;
+  if (perTick_us < min_us) perTick_us = min_us;
+
+  long errX = 0, errY = 0;
+  long accX = 0, accY = 0;
+
+  bool haciaMinX = (!dirXpos) ^ INVERT_DIR_X;
+  bool haciaMinY = (!dirYpos) ^ INVERT_DIR_Y;
+
+  unsigned long t0 = micros();
+  for (long i = 0; i < nTicks; i++) {
+    bool doX = false, doY = false;
+    errX += sx; if (errX >= nTicks) { errX -= nTicks; doX = true; }
+    errY += sy; if (errY >= nTicks) { errY -= nTicks; doY = true; }
+
+    // Endstops si vamos hacia MIN
+    if (doX && haciaMinX && endstopActive(ENDSTOP_X)) { Serial.println("⚠️ Endstop X"); break; }
+    if (doY && haciaMinY && endstopActive(ENDSTOP_Y)) { Serial.println("⚠️ Endstop Y"); break; }
+
+    if (doX) { pulseStep(STEP_X); accX += dirXpos ? 1 : -1; }
+    if (doY) { pulseStep(STEP_Y); accY += dirYpos ? 1 : -1; }
+
+    // Ritmo a feedrate (simple)
+    unsigned long nextT = t0 + (unsigned long)((i+1) * perTick_us);
+    while ((long)(micros() - nextT) < 0) { /* spin wait */ }
+  }
+
+  // Actualiza posición real (en mm) desde los pasos realmente emitidos
+  posX += (accX / stepsPerMM_X);
+  posY += (accY / stepsPerMM_Y);
+}
+
+void moverEje(int dirPin, int stepPin, bool sentidoPositivo, long pasos,
+              int endstopPin, bool chequearEndstopAlMin, bool invertAxis)
+{
+  setDir(dirPin, sentidoPositivo, invertAxis);
+
+  for (long i = 0; i < pasos; i++) {
+    bool vamosHaciaMin = !sentidoPositivo;
+    bool realmenteHaciaMin = vamosHaciaMin ^ invertAxis;
+    if (chequearEndstopAlMin && realmenteHaciaMin && endstopActive(endstopPin)) {
+      Serial.println("⚠️ Endstop alcanzado");
+      break;
+    }
+    pulseStep(stepPin);
+  }
+}
+
+void moverZmm(float distanciaMM) { // Z aproximado (ajustá si querés)
+  float d = INVERT_DIR_Z ? -distanciaMM : distanciaMM;
+  int pasos = abs(d * 1024 / 2); // tu conversión original
+  motorZ.step(d > 0 ? pasos : -pasos);
+  posZ += distanciaMM;
+}
+
+//=================== HOMING ===================//
+void homeEje(int dirPin, int stepPin, int endPin, bool invertAxis, bool homeToMin) {
+  bool sentidoPositivo = !homeToMin; // si homeToMin=true => hacia negativo
+  setDir(dirPin, sentidoPositivo, invertAxis);
+
+  while (!endstopActive(endPin)) pulseStep(stepPin);
+
+  // Pull-off
+  setDir(dirPin, !sentidoPositivo, invertAxis);
+  for (int i = 0; i < 200; i++) pulseStep(stepPin);
+
+  // Segundo toque
+  setDir(dirPin, sentidoPositivo, invertAxis);
+  for (int i = 0; i < 2000 && !endstopActive(endPin); i++) pulseStep(stepPin);
+}
+
+void hacerHome() {
+  Serial.println("🏠 Homing...");
+  homeEje(DIR_X, STEP_X, ENDSTOP_X, INVERT_DIR_X, HOME_TO_MIN_X);
+  homeEje(DIR_Y, STEP_Y, ENDSTOP_Y, INVERT_DIR_Y, HOME_TO_MIN_Y);
+  posX = HOME_TO_MIN_X ? X_MIN_MM : X_MAX_MM;
+  posY = HOME_TO_MIN_Y ? Y_MIN_MM : Y_MAX_MM;
+  posZ = 0.0f;
+  Serial.println("✅ Homing completo");
+}
+
+//=================== ARCOS G2/G3 (I,J) ===================//
+// >>> Interpolación de arco usando I,J (centro relativo al punto inicial).
+//     directionCW: true = G2 (clockwise), false = G3 (counterclockwise)
+void moverArcoIJ(float xTarget, float yTarget, float I, float J, bool directionCW) {
+  // Punto inicial
+  float x0 = posX, y0 = posY;
+
+  // Centro del arco (I,J son relativos al inicio, estándar GRBL)
+  float cx = x0 + I;
+  float cy = y0 + J;
+
+  // Vectores desde el centro hacia inicio y fin
+  float sx = x0 - cx, sy = y0 - cy;
+  float ex = xTarget - cx, ey = yTarget - cy;
+
+  // Radios (idealmente iguales)
+  float r0 = sqrt(sx*sx + sy*sy);
+  float r1 = sqrt(ex*ex + ey*ey);
+  if (r0 < 1e-6 || r1 < 1e-6) { Serial.println("⚠️ Arco inválido (radio ~0)"); return; }
+
+  // Ángulos
+  float a0 = atan2(sy, sx);
+  float a1 = atan2(ey, ex);
+
+  // Delta ángulo según sentido
+  float dA = a1 - a0;
+  if (directionCW) {
+    // Forzar CW: ángulo negativo o equivalente
+    if (dA >= 0) dA -= 2 * M_PI;
+  } else {
+    // CCW: ángulo positivo
+    if (dA <= 0) dA += 2 * M_PI;
+  }
+
+  float arcoLen = fabs(dA) * ((r0 + r1) * 0.5f); // aprox longitud
+  // Segmentación: ~0.5 mm por segmento (suave) mínimo 12
+  int nSeg = (int)ceil(arcoLen / 0.5f);
+  if (nSeg < 12) nSeg = 12;
+
+  // Genero puntos intermedios y muevo en líneas cortas coordinadas
+  for (int i = 1; i <= nSeg; i++) {
+    float t = (float)i / (float)nSeg;
+    float ang = a0 + dA * t;
+    float x = cx + cosf(ang) * r0; // radio constante = r0
+    float y = cy + sinf(ang) * r0;
+
+    // Soft limits: si el punto cae fuera, aborto el arco
+    if (!insideLimits(x, y)) {
+      Serial.println("⛔ Soft limit en arco, movimiento cancelado");
+      return;
+    }
+
+    float dx = x - posX;
+    float dy = y - posY;
+    moverLinealXY(dx, dy, feed_mm_min);
+  }
+}
+
+//=================== PARSER ===================//
+static float leerNumero(const String& s, int idx) {
+  if (idx == -1) return NAN;
+  int j = idx + 1;
+  while (j < s.length() && (isDigit(s[j]) || s[j]=='-' || s[j]=='+' || s[j]=='.')) j++;
+  return s.substring(idx + 1, j).toFloat();
+}
+
+void interpretarComando(String cmd) {
+  cmd.trim(); cmd.toUpperCase();
+  if (cmd.length() == 0) return;
+
+  // --- Modales básicos (>>> NUEVO)
+  if (cmd.startsWith("G90")) { absoluteMode = true;  Serial.println("Modo: G90 (absoluto)"); return; }
+  if (cmd.startsWith("G91")) { absoluteMode = false; Serial.println("Modo: G91 (relativo)"); return; }
+
+  // --- G92: fijar posición actual (>>> NUEVO)
+  if (cmd.startsWith("G92")) {
+    int ix = cmd.indexOf('X');
+    int iy = cmd.indexOf('Y');
+    int iz = cmd.indexOf('Z');
+    float nx = leerNumero(cmd, ix);
+    float ny = leerNumero(cmd, iy);
+    float nz = leerNumero(cmd, iz);
+    if (!isnan(nx)) posX = nx;
+    if (!isnan(ny)) posY = ny;
+    if (!isnan(nz)) posZ = nz;
+    Serial.printf("G92 -> Pos: X=%.3f Y=%.3f Z=%.3f\n", posX, posY, posZ);
+    return;
+  }
+
+  // --- HOME / G28
+  if (cmd.startsWith("HOME") || cmd.startsWith("G28")) { hacerHome(); return; }
+
+  // --- F: feedrate (mm/min) (puede venir solo o junto a G0/G1/G2/G3) (>>> NUEVO)
+  int iF = cmd.indexOf('F');
+  if (iF != -1) {
+    float f = leerNumero(cmd, iF);
+    if (f > 0) { feed_mm_min = f; Serial.printf("Feedrate: %.1f mm/min\n", feed_mm_min); }
+  }
+
+  // --- Movimientos lineales G0/G1 (>>> usa XY coordinado + absoluto/relativo)
+  if (cmd.startsWith("G0") || cmd.startsWith("G1")) {
+    float x = leerNumero(cmd, cmd.indexOf('X'));
+    float y = leerNumero(cmd, cmd.indexOf('Y'));
+    float z = leerNumero(cmd, cmd.indexOf('Z'));
+
+    float tgtX = posX, tgtY = posY, dz = 0;
+
+    if (absoluteMode) {
+      if (!isnan(x)) tgtX = x;
+      if (!isnan(y)) tgtY = y;
+      if (!insideLimits(tgtX, tgtY)) { Serial.println("⛔ Soft limit, G0/G1 cancelado"); return; }
+    } else {
+      if (!isnan(x)) tgtX += x;
+      if (!isnan(y)) tgtY += y;
+      if (!insideLimits(tgtX, tgtY)) { Serial.println("⛔ Soft limit, G0/G1 cancelado"); return; }
+    }
+
+    float dx = tgtX - posX;
+    float dy = tgtY - posY;
+
+    float useF = cmd.startsWith("G0") ? RAPID_FEED_MM_MIN : feed_mm_min;
+    if (!isnan(x) || !isnan(y)) moverLinealXY(dx, dy, useF);
+
+    if (!isnan(z)) {
+      dz = absoluteMode ? (z - posZ) : z;
+      moverZmm(dz);
+    }
+
+    Serial.printf("📍 Pos: X=%.3f Y=%.3f Z=%.3f\n", posX, posY, posZ);
+    return;
+  }
+
+  // --- Arcos G2/G3 con I,J (centro relativo) (>>> NUEVO)
+  if (cmd.startsWith("G2") || cmd.startsWith("G3")) {
+    bool cw = cmd.startsWith("G2"); // G2=clockwise, G3=counter
+    float x = leerNumero(cmd, cmd.indexOf('X'));
+    float y = leerNumero(cmd, cmd.indexOf('Y'));
+    float I = leerNumero(cmd, cmd.indexOf('I'));
+    float J = leerNumero(cmd, cmd.indexOf('J'));
+
+    // Destino en ABS/REL
+    float tgtX = posX, tgtY = posY;
+    if (!isnan(x)) { tgtX = absoluteMode ? x : (posX + x); }
+    if (!isnan(y)) { tgtY = absoluteMode ? y : (posY + y); }
+
+    if (!insideLimits(tgtX, tgtY)) { Serial.println("⛔ Soft limit, G2/G3 cancelado"); return; }
+    if (isnan(I) || isnan(J)) { Serial.println("⚠️ G2/G3 requiere I y J"); return; }
+
+    moverArcoIJ(tgtX, tgtY, I, J, cw);
+    Serial.printf("📍 Pos: X=%.3f Y=%.3f Z=%.3f\n", posX, posY, posZ);
+    return;
+  }
+
+  Serial.println("❓ Comando desconocido");
+}
+
+//=================== SETUP / LOOP ===================//
+void setup() {
+  Serial.begin(115200);
+  Serial.println("✅ Mini CNC ESP32 (DRV8825 1/16, 80 steps/mm) + G90/G91 + F + XY coordinado + G92 + G2/G3(IJ)");
+
+  pinMode(DIR_X, OUTPUT); pinMode(STEP_X, OUTPUT);
+  pinMode(DIR_Y, OUTPUT); pinMode(STEP_Y, OUTPUT);
+
+  pinMode(ENDSTOP_X, INPUT_PULLUP);
+  pinMode(ENDSTOP_Y, INPUT_PULLUP);
+
+  if (EN_PIN != -1)  { pinMode(EN_PIN, OUTPUT);  digitalWrite(EN_PIN, LOW); } // habilitado
+  if (SLP_PIN != -1) { pinMode(SLP_PIN, OUTPUT); digitalWrite(SLP_PIN, HIGH); }
+  if (RST_PIN != -1) { pinMode(RST_PIN, OUTPUT); digitalWrite(RST_PIN, HIGH); }
+
+  motorZ.setSpeed(velocidadZ);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String comando = Serial.readStringUntil('\n');
+    interpretarComando(comando);
+  }
+}
