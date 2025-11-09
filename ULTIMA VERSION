@@ -268,3 +268,7 @@ void loop() {
     interpretarComando(comando);
   }
 }
+
+
+
+#controlar el toll, te recuerdo que cambiaste algunas cosas, fijate antes de probar codigo!!
