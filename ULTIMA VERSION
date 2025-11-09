@@ -1,0 +1,270 @@
+#include <Arduino.h>
+#include <Stepper.h>
+#include <math.h>
+
+//=================== CONFIG. PINES ===================//
+// NEMA17 X/Y con DRV8825
+#define DIR_X   27
+#define STEP_X  14
+#define DIR_Y   25
+#define STEP_Y  26
+
+// OPCIONAL: si conectás ENABLE (EN) del DRV8825 a un GPIO, ponelo aquí.
+// Si NO lo usás (EN a GND), dejá -1.
+#define EN_PIN  -1
+
+// Si conectás SLEEP y RESET a un GPIO, podés manejarlos acá.
+// Si los uniste y los llevaste a VDD, dejá -1.
+#define SLP_PIN -1
+#define RST_PIN -1
+
+// 28BYJ-48 - Eje Z (ULN2003)
+#define IN1 16
+#define IN2 17
+#define IN3 18
+#define IN4 19
+Stepper motorZ(2048, IN1, IN3, IN2, IN4);  // orden correcto ULN2003
+
+// Endstops (NC -> a GND, reposo HIGH)
+#define ENDSTOP_X 32
+#define ENDSTOP_Y 33
+
+//=================== DIRECCIONES / HOMING ===================//
+const bool INVERT_DIR_X = true;
+const bool INVERT_DIR_Y = true;
+const bool INVERT_DIR_Z = true;
+const bool HOME_TO_MIN_X = true;
+const bool HOME_TO_MIN_Y = true;
+
+//=================== CINEMÁTICA ===================//
+const float stepsPerMM_X = 80.0f;
+const float stepsPerMM_Y = 80.0f;
+
+// Límites en mm (solo referenciales, ya no usados como “soft limits”)
+const float X_MIN_MM = 0.0f;
+const float X_MAX_MM = 200.0f;
+const float Y_MIN_MM = 0.0f;
+const float Y_MAX_MM = 180.0f;
+
+// Timing
+const unsigned int STEP_PULSE_US = 5;
+const unsigned int STEP_GAP_US   = 100;
+const unsigned int DIR_SETUP_US  = 10;
+const float RAPID_FEED_MM_MIN    = 3000;
+
+// Z
+int velocidadZ = 15;
+
+// Posición actual
+float posX = 0.0f, posY = 0.0f, posZ = 0.0f;
+
+// Estados G-code
+bool absoluteMode = true;
+float feed_mm_min = 300.0f;
+
+//=================== HELPERS ===================//
+inline void pulseStep(uint8_t stepPin) {
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(STEP_PULSE_US);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(STEP_GAP_US);
+}
+
+bool endstopActive(uint8_t pin) {
+  int c = 0;
+  for (int i = 0; i < 5; i++) { c += (digitalRead(pin) == LOW); delay(1); }
+  return c >= 4;
+}
+
+inline void setDir(uint8_t dirPin, bool sentidoPositivo, bool invertAxis) {
+  bool nivel = (sentidoPositivo ^ invertAxis) ? HIGH : LOW;
+  digitalWrite(dirPin, nivel);
+  delayMicroseconds(DIR_SETUP_US);
+}
+
+//=================== MOVIMIENTO ===================//
+void moverLinealXY(float dx_mm, float dy_mm, float feed_mm_minute) {
+  long sx = lround(fabs(dx_mm) * stepsPerMM_X);
+  long sy = lround(fabs(dy_mm) * stepsPerMM_Y);
+  if (sx == 0 && sy == 0) return;
+
+  bool dirXpos = dx_mm >= 0;
+  bool dirYpos = dy_mm >= 0;
+
+  setDir(DIR_X, dirXpos, INVERT_DIR_X);
+  setDir(DIR_Y, dirYpos, INVERT_DIR_Y);
+
+  float dist_mm = sqrt(dx_mm*dx_mm + dy_mm*dy_mm);
+  float v_mms   = max(1.0f, feed_mm_minute / 60.0f);
+  float dur_s   = dist_mm / v_mms;
+  long  nTicks  = max((long)1, max(sx, sy));
+  unsigned long perTick_us = (unsigned long)((dur_s * 1e6) / nTicks);
+  unsigned long min_us = STEP_PULSE_US + STEP_GAP_US;
+  if (perTick_us < min_us) perTick_us = min_us;
+
+  long errX = 0, errY = 0;
+  long accX = 0, accY = 0;
+
+// ✅ Detecta correctamente hacia dónde se mueve el eje
+// true = movimiento hacia el home (mínimo)
+  bool haciaMinX = (HOME_TO_MIN_X && !dirXpos) || (!HOME_TO_MIN_X && dirXpos);
+  bool haciaMinY = (HOME_TO_MIN_Y && !dirYpos) || (!HOME_TO_MIN_Y && dirYpos);
+
+  unsigned long t0 = micros();
+  for (long i = 0; i < nTicks; i++) {
+    bool doX = false, doY = false;
+    errX += sx; if (errX >= nTicks) { errX -= nTicks; doX = true; }
+    errY += sy; if (errY >= nTicks) { errY -= nTicks; doY = true; }
+
+    // Solo detener si nos estamos moviendo HACIA el home y el endstop ya está presionado
+  if (doX) {
+  bool activoX = endstopActive(ENDSTOP_X);
+  if (haciaMinX && activoX) { Serial.println("⚠️ Endstop X (hacia home)"); break; }
+  }
+
+  if (doY) {
+  bool activoY = endstopActive(ENDSTOP_Y);
+  if (haciaMinY && activoY) { Serial.println("⚠️ Endstop Y (hacia home)"); break; }
+  }
+
+    if (doX) { pulseStep(STEP_X); accX += dirXpos ? 1 : -1; }
+    if (doY) { pulseStep(STEP_Y); accY += dirYpos ? 1 : -1; }
+
+    unsigned long nextT = t0 + (unsigned long)((i+1) * perTick_us);
+    while ((long)(micros() - nextT) < 0) { }
+  }
+
+  posX += (accX / stepsPerMM_X);
+  posY += (accY / stepsPerMM_Y);
+}
+
+void moverZmm(float distanciaMM) {
+  float d = INVERT_DIR_Z ? -distanciaMM : distanciaMM;
+  int pasos = abs(d * 1024 / 2);
+  motorZ.step(d > 0 ? pasos : -pasos);
+  posZ += distanciaMM;
+}
+
+//=================== HOMING ===================//
+void homeEje(int dirPin, int stepPin, int endPin, bool invertAxis, bool homeToMin) {
+  bool sentidoPositivo = !homeToMin; // hacia el endstop
+  setDir(dirPin, sentidoPositivo, invertAxis);
+
+  // Primer toque hasta que se active el endstop
+  while (!endstopActive(endPin)) pulseStep(stepPin);
+
+  // 🔹 Retrocede (pull-off)
+  setDir(dirPin, !sentidoPositivo, invertAxis);
+  for (int i = 0; i < 400; i++) pulseStep(stepPin); // podés ajustar 400 según tu mecánica
+
+  delay(50); // pequeña pausa mecánica
+
+  // 🔹 Segundo toque lento para precisión
+  setDir(dirPin, sentidoPositivo, invertAxis);
+  for (int i = 0; i < 2000 && !endstopActive(endPin); i++) pulseStep(stepPin);
+
+  delay(50); // pausa final
+}
+
+void hacerHome() {
+  Serial.println("🏠 Homing...");
+  homeEje(DIR_X, STEP_X, ENDSTOP_X, INVERT_DIR_X, HOME_TO_MIN_X);
+  homeEje(DIR_Y, STEP_Y, ENDSTOP_Y, INVERT_DIR_Y, HOME_TO_MIN_Y);
+  posX = HOME_TO_MIN_X ? X_MIN_MM : X_MAX_MM;
+  posY = HOME_TO_MIN_Y ? Y_MIN_MM : Y_MAX_MM;
+  posZ = 0.0f;
+  Serial.println("✅ Homing completo");
+}
+
+//=================== PARSER ===================//
+static float leerNumero(const String& s, int idx) {
+  if (idx == -1) return NAN;
+  int j = idx + 1;
+  while (j < s.length() && (isDigit(s[j]) || s[j]=='-' || s[j]=='+' || s[j]=='.')) j++;
+  return s.substring(idx + 1, j).toFloat();
+}
+
+void interpretarComando(String cmd) {
+  cmd.trim(); cmd.toUpperCase();
+  if (cmd.length() == 0) return;
+
+  if (cmd.startsWith("G90")) { absoluteMode = true;  Serial.println("Modo: G90 (absoluto)"); return; }
+  if (cmd.startsWith("G91")) { absoluteMode = false; Serial.println("Modo: G91 (relativo)"); return; }
+
+  if (cmd.startsWith("G92")) {
+    int ix = cmd.indexOf('X');
+    int iy = cmd.indexOf('Y');
+    int iz = cmd.indexOf('Z');
+    float nx = leerNumero(cmd, ix);
+    float ny = leerNumero(cmd, iy);
+    float nz = leerNumero(cmd, iz);
+    if (!isnan(nx)) posX = nx;
+    if (!isnan(ny)) posY = ny;
+    if (!isnan(nz)) posZ = nz;
+    Serial.printf("G92 -> Pos: X=%.3f Y=%.3f Z=%.3f\n", posX, posY, posZ);
+    return;
+  }
+
+  if (cmd.startsWith("HOME") || cmd.startsWith("G28")) { hacerHome(); return; }
+
+  int iF = cmd.indexOf('F');
+  if (iF != -1) {
+    float f = leerNumero(cmd, iF);
+    if (f > 0) { feed_mm_min = f; Serial.printf("Feedrate: %.1f mm/min\n", feed_mm_min); }
+  }
+
+  if (cmd.startsWith("G0") || cmd.startsWith("G1")) {
+    float x = leerNumero(cmd, cmd.indexOf('X'));
+    float y = leerNumero(cmd, cmd.indexOf('Y'));
+    float z = leerNumero(cmd, cmd.indexOf('Z'));
+
+    float tgtX = posX, tgtY = posY, dz = 0;
+
+    if (absoluteMode) {
+      if (!isnan(x)) tgtX = x;
+      if (!isnan(y)) tgtY = y;
+    } else {
+      if (!isnan(x)) tgtX += x;
+      if (!isnan(y)) tgtY += y;
+    }
+
+    float dx = tgtX - posX;
+    float dy = tgtY - posY;
+    float useF = cmd.startsWith("G0") ? RAPID_FEED_MM_MIN : feed_mm_min;
+
+    if (!isnan(x) || !isnan(y)) moverLinealXY(dx, dy, useF);
+    if (!isnan(z)) {
+      dz = absoluteMode ? (z - posZ) : z;
+      moverZmm(dz);
+    }
+
+    Serial.printf("📍 Pos: X=%.3f Y=%.3f Z=%.3f\n", posX, posY, posZ);
+    return;
+  }
+
+  Serial.println("❓ Comando desconocido");
+}
+
+//=================== SETUP / LOOP ===================//
+void setup() {
+  Serial.begin(115200);
+  Serial.println("✅ Mini CNC ESP32 sin soft limits (DRV8825 1/16, 80 steps/mm)");
+
+  pinMode(DIR_X, OUTPUT); pinMode(STEP_X, OUTPUT);
+  pinMode(DIR_Y, OUTPUT); pinMode(STEP_Y, OUTPUT);
+  pinMode(ENDSTOP_X, INPUT_PULLUP);
+  pinMode(ENDSTOP_Y, INPUT_PULLUP);
+
+  if (EN_PIN != -1)  { pinMode(EN_PIN, OUTPUT);  digitalWrite(EN_PIN, LOW); }
+  if (SLP_PIN != -1) { pinMode(SLP_PIN, OUTPUT); digitalWrite(SLP_PIN, HIGH); }
+  if (RST_PIN != -1) { pinMode(RST_PIN, OUTPUT); digitalWrite(RST_PIN, HIGH); }
+
+  motorZ.setSpeed(velocidadZ);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String comando = Serial.readStringUntil('\n');
+    interpretarComando(comando);
+  }
+}
